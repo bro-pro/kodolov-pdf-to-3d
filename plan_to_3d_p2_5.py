@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-plan_to_3d.py v14.5 — P2.3 adaptive PDF parser — P1.6 full wall extent + plan-area parsing — 3D-модель квартиры по плану в PDF.
+plan_to_3d.py v14.5 — v1.1 room-grid fix — P2.3 adaptive PDF parser — P1.6 full wall extent + plan-area parsing — 3D-модель квартиры по плану в PDF.
 
 Изменения v12 (P1.2a — правки scoring дверей по итогам v11):
   * УБРАН признак jamb_on_wall — для распашной двери jamb НЕ на стене,
@@ -2205,9 +2205,14 @@ def build_from_segments(segments, words, areas, args,
         verbose=args.debug,
     )
     if getattr(args, "auto_adaptive", False) and not areas:
-        room_polys = []
+        # v1.1: для CAD-планов без надёжных площадей нельзя обнулять
+        # найденные замкнутые контуры. Polygonize уже работает по выбранному
+        # wall-layer и возвращает именно замкнутые ячейки стеновой сети.
+        # Используем их как геометрические помещения; названия/площади из OCR
+        # при этом не выдумываем.
+        room_polys = polys
         if args.debug:
-            print("[ROOM] OCR-площади не считаются площадями помещений — используем wall-grid")
+            print(f"[ROOM] нет надёжных OCR-площадей — используем {len(room_polys)} замкнутых CAD-контуров")
     else:
         room_polys = select_room_polys_by_labels(
             polys, words, wb, scale, target_areas=areas, verbose=args.debug
@@ -2216,18 +2221,31 @@ def build_from_segments(segments, words, areas, args,
         print_polygon_area_report(room_polys, scale, areas)
 
     if room_polys:
-        bsegs = dedupe_boundary_segments(
-            polygon_boundary_segments(room_polys, scale),
-            tol_pt=max(2.0, 0.03 / max(s0, 1e-9))
-        )
-        model_H=[]; model_V=[]
-        for axis,pos,a,b in bsegs:
-            if axis == "h":
-                model_H.append({"center":pos,"intervals":[(a,b)],"n":2,"thick_pts":DEFAULT_THICK/s0})
-            else:
-                model_V.append({"center":pos,"intervals":[(a,b)],"n":2,"thick_pts":DEFAULT_THICK/s0})
-        if args.debug:
-            print(f"[WALL3D] осевых сегментов из комнат: {len(bsegs)}")
+        if getattr(args, "auto_adaptive", False) and not areas:
+            # v1.1: комнаты и стеновая 3D-сетка — разные уровни модели.
+            # Для CAD-планов без текстовых площадей polygonize даёт полезные
+            # замкнутые помещения, но его границы могут не содержать короткие
+            # участки исходного wall-layer. Поэтому сохраняем полную CAD-сетку
+            # для стен/проёмов, а найденные полигоны используем для комнат и
+            # топологии. Это не теряет площадь внешнего контура.
+            model_H, model_V = bridge_gaps_in_walls(
+                walls_h, walls_v, gap_tol=BRIDGE_GAP_TOL_M / s0
+            )
+            if args.debug:
+                print(f"[WALL3D] комнаты из CAD-контуров, стены из полной wall-grid: {len(model_H)+len(model_V)} осей")
+        else:
+            bsegs = dedupe_boundary_segments(
+                polygon_boundary_segments(room_polys, scale),
+                tol_pt=max(2.0, 0.03 / max(s0, 1e-9))
+            )
+            model_H=[]; model_V=[]
+            for axis,pos,a,b in bsegs:
+                if axis == "h":
+                    model_H.append({"center":pos,"intervals":[(a,b)],"n":2,"thick_pts":DEFAULT_THICK/s0})
+                else:
+                    model_V.append({"center":pos,"intervals":[(a,b)],"n":2,"thick_pts":DEFAULT_THICK/s0})
+            if args.debug:
+                print(f"[WALL3D] осевых сегментов из комнат: {len(bsegs)}")
     else:
         # P2.0 fallback для CAD-планов без текстовых площадей: сами пары
         # чёрных wall-edge линий уже являются надёжной осевой сеткой.
