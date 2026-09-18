@@ -963,26 +963,123 @@ def detect_plan_page(path, requested=None, verbose=False):
 
 
 def synthesize_ocr_words(path,page_no):
-    """OCR только как fallback для PDF, где CAD-текст экспортирован кривыми."""
+    """OCR fallback for CAD PDFs where text/dimension labels are curves.
+
+    Many CAD exports keep dimension labels as blue vector outlines rather than
+    PDF text. A blue-mask pass is fast, robust to the black wall grid, and is
+    sufficient for the tested plans.
+    """
     try:
         import pytesseract
-        from PIL import Image
+        import numpy as np
+        import cv2
     except Exception:
         return []
     doc=fitz.open(path); page=doc[page_no]
     pix=page.get_pixmap(dpi=400, colorspace=fitz.csRGB, alpha=False)
-    im=Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
-    data=pytesseract.image_to_data(im,lang="rus+eng",config="--psm 11",
-                                   output_type=pytesseract.Output.DICT)
+    rgb=np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height,pix.width,3)
+    doc.close()
+    bgr=cv2.cvtColor(rgb,cv2.COLOR_RGB2BGR)
+    hsv=cv2.cvtColor(bgr,cv2.COLOR_BGR2HSV)
+    mask=cv2.inRange(hsv,np.array([80,60,40],dtype=np.uint8),
+                     np.array([135,255,255],dtype=np.uint8))
+    mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,np.ones((2,2),np.uint8))
+    try:
+        data=pytesseract.image_to_data(mask,lang="rus+eng",config="--psm 11",
+                                       output_type=pytesseract.Output.DICT)
+    except Exception:
+        return []
     k=400/72.0; out=[]
     for i,t in enumerate(data.get("text",[])):
         t=(t or "").strip()
         if not t: continue
-        x=(data["left"][i]+data["width"][i]/2)/k
-        y=(data["top"][i]+data["height"][i]/2)/k
-        out.append({"text":t,"x":x,"y":y})
-    doc.close(); return out
+        try: conf=float(data["conf"][i])
+        except Exception: conf=0.0
+        if conf < 15: continue
+        out.append({"text":t,"x":(data["left"][i]+data["width"][i]/2)/k,
+                    "y":(data["top"][i]+data["height"][i]/2)/k,
+                    "confidence":conf,"source":"blue"})
+    return out
 
+
+
+def extract_doors_from_cad_layer(path,page_no,layer_name,scale,verbose=False):
+    """Extract explicit door symbols from a dedicated CAD door layer.
+
+    A typical CAD export stores the leaf as one straight segment and the swing
+    as a polyline of short segments. We pair them conservatively and emit the
+    same OpeningCandidate consumed by the normal wall/opening pipeline.
+    """
+    if not layer_name:
+        return []
+    doc=fitz.open(path); page=doc[page_no]
+    drawings=[d for d in page.get_drawings() if _layer_name(d)==layer_name]
+    doc.close()
+    lines=[]; curves=[]
+    for di,d in enumerate(drawings):
+        its=d.get("items",[])
+        for ii,it in enumerate(its):
+            if it[0] == "l":
+                a=(it[1].x,it[1].y); b=(it[2].x,it[2].y)
+                L=_dist(a,b)*scale
+                if DOOR_LEAF_MIN_M <= L <= DOOR_LEAF_MAX_M:
+                    lines.append((a,b,di,ii,L))
+            elif it[0] == "qu":
+                # Door leaves may be exported as a thin Quad rather than a line.
+                q=it[1]
+                pts=[(q.ul.x,q.ul.y),(q.ur.x,q.ur.y),(q.ll.x,q.ll.y),(q.lr.x,q.lr.y)]
+                pairs=[(pts[0],pts[1]),(pts[0],pts[2]),(pts[1],pts[3]),(pts[2],pts[3])]
+                a,b=max(pairs,key=lambda ab:_dist(ab[0],ab[1]))
+                L=_dist(a,b)*scale
+                if DOOR_LEAF_MIN_M <= L <= DOOR_LEAF_MAX_M:
+                    lines.append((a,b,di,ii,L))
+        pts=[]
+        for it in its:
+            if it[0]=="l":
+                if not pts: pts.append((it[1].x,it[1].y))
+                pts.append((it[2].x,it[2].y))
+        if len(pts)>=6:
+            plen=sum(_dist(a,b) for a,b in zip(pts,pts[1:]))*scale
+            if DOOR_LEAF_MIN_M*0.75 <= plen <= DOOR_LEAF_MAX_M*1.5:
+                curves.append((pts,di,plen))
+    out=[]
+    for lp0,lp1,ldi,li,leaf_len in lines:
+        best=None
+        for pts,cdi,clen in curves:
+            if cdi==ldi: continue
+            near=min(_dist(lp0,pts[0]),_dist(lp0,pts[-1]),
+                     _dist(lp1,pts[0]),_dist(lp1,pts[-1]))*scale
+            if near>0.18: continue
+            circle=_fit_circle(pts)
+            if circle is None: continue
+            cx,cy,r=circle
+            err=abs(r*scale-leaf_len)/max(leaf_len,0.01)
+            if err>0.20: continue
+            rank=(err,near)
+            if best is None or rank<best[0]:
+                best=(rank,(cx,cy,r),pts)
+        if best is None: continue
+        _,(cx,cy,r),pts=best
+        hinge=(cx,cy)
+        if _dist(lp0,hinge)<=_dist(lp1,hinge):
+            leaf0,leaf1=lp0,lp1
+        else:
+            leaf0,leaf1=lp1,lp0
+        orient="v" if abs(leaf1[0]-leaf0[0])<abs(leaf1[1]-leaf0[1]) else "h"
+        out.append(OpeningCandidate(
+            kind="door",source="cad-layer",confidence=0.99,
+            p0=hinge,p1=leaf1,width_m=leaf_len,orientation=orient,
+            bottom=0.0,top=DOOR_HEIGHT,
+            meta={"cad_layer":layer_name,"leaf_p0":leaf0,"leaf_p1":leaf1,
+                  "hinge_center":hinge,"jamb":leaf1,"arc_radius_m":r*scale}))
+    dedup=[]
+    for c in out:
+        if any(_dist(c.p0,q.p0)*scale<0.15 and abs(c.width_m-q.width_m)<0.15 for q in dedup):
+            continue
+        dedup.append(c)
+    if verbose:
+        print(f"[DOOR-CAD] слой {layer_name!r}: найдено {len(dedup)} явных дверей")
+    return dedup
 
 def parse_ocr_dimensions(words):
     vals=[]
@@ -2763,14 +2860,21 @@ def main():
 
             print(f"\n=== Детекция дверей (score ≥ {args.door_score}) ===")
             if door_layer and door_layer not in WALL_LAYERS:
-                # P2.0: пока не смешиваем специальный CAD-слой дверей с
-                # универсальным arc/leaf detector. Его геометрия будет
-                # подключена отдельным парсером после валидации bbox.
-                opening_candidates, used_leaf_pts, door_stats = [], set(), {
-                    'raw':0,'accepted_by_score':0,'rejected_by_score':0,'after_nms':0,
-                    'hist':{},'rejected_diag':[],'all_scored':[]
+                # Dedicated CAD door layer: use its explicit geometry first.
+                opening_candidates = extract_doors_from_cad_layer(
+                    pdf_path, args.page, door_layer, s0_guess, verbose=args.debug
+                )
+                used_leaf_pts=set()
+                for c in opening_candidates:
+                    for lp in (c.meta.get("leaf_p0"),c.meta.get("leaf_p1")):
+                        if lp: used_leaf_pts.add((round(lp[0],3),round(lp[1],3)))
+                door_stats = {
+                    'raw':len(opening_candidates),'accepted_by_score':len(opening_candidates),
+                    'rejected_by_score':0,'after_nms':len(opening_candidates),
+                    'histogram':{},'top_rejected':[], 'merge_log':[],
+                    'score_accept':args.door_score, 'after_arc_dedup':len(opening_candidates)
                 }
-                print(f"  специальный слой дверей обнаружен: {door_layer!r} (геометрический detector P1 отключён)")
+                print(f"  специальный слой дверей обнаружен: {door_layer!r} (используется CAD-door parser)")
             else:
                 opening_candidates, used_leaf_pts, door_stats = extract_doors_v2(
                     pdf_path, args.page, scale=s0_guess,
