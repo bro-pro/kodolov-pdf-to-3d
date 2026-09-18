@@ -43,7 +43,7 @@ pip install -r requirements.txt
 Проверка:
 
 ```bash
-python -c "import fitz, trimesh, shapely, openpyxl, numpy; print('OK')"
+python -c "import fitz, trimesh, shapely, openpyxl, numpy, pytesseract, cv2; print('OK')"
 ```
 
 ### Что устанавливать НЕ нужно
@@ -58,7 +58,17 @@ python -c "import fitz, trimesh, shapely, openpyxl, numpy; print('OK')"
 
 Blender можно использовать отдельно для просмотра готового `.glb`.
 
-Tesseract OCR является дополнительным инструментом для OCR-сценариев и не нужен для базового запуска на текущих векторных планах.
+### OCR для CAD-размеров
+
+Для автоматического чтения размерных цепочек из CAD-PDF проект использует `pytesseract` + OpenCV. Python-зависимости устанавливаются через `requirements.txt`. Дополнительно в системе должен быть установлен Tesseract OCR.
+
+Для русских подписей и размерных обозначений рекомендуется установить языковой пакет `rus`. Проверка:
+
+```bash
+tesseract --list-langs
+```
+
+В минимальном случае достаточно `eng` для цифровых размеров. Если Tesseract или Python OCR-зависимости недоступны, проект не падает: он явно сообщает об отключённом OCR и использует fallback-масштаб.
 
 ## Структура папки
 

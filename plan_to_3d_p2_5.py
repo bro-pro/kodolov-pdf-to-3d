@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-plan_to_3d.py v14.5 — v1.1 room-grid fix — P2.3 adaptive PDF parser — P1.6 full wall extent + plan-area parsing — 3D-модель квартиры по плану в PDF.
+plan_to_3d.py v14.6 — v1.3 OCR dependency/diagnostics — P2.3 adaptive PDF parser — P1.6 full wall extent + plan-area parsing — 3D-модель квартиры по плану в PDF.
 
 Изменения v12 (P1.2a — правки scoring дверей по итогам v11):
   * УБРАН признак jamb_on_wall — для распашной двери jamb НЕ на стене,
@@ -969,11 +969,21 @@ def synthesize_ocr_words(path,page_no):
     PDF text. A blue-mask pass is fast, robust to the black wall grid, and is
     sufficient for the tested plans.
     """
+    missing=[]
     try:
         import pytesseract
+    except ImportError:
+        missing.append("pytesseract")
+    try:
         import numpy as np
+    except ImportError:
+        missing.append("numpy")
+    try:
         import cv2
-    except Exception:
+    except ImportError:
+        missing.append("opencv-python")
+    if missing:
+        print("[OCR] зависимости не установлены: " + ", ".join(missing) + "; OCR отключён, используется fallback")
         return []
     doc=fitz.open(path); page=doc[page_no]
     pix=page.get_pixmap(dpi=400, colorspace=fitz.csRGB, alpha=False)
@@ -985,9 +995,17 @@ def synthesize_ocr_words(path,page_no):
                      np.array([135,255,255],dtype=np.uint8))
     mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,np.ones((2,2),np.uint8))
     try:
-        data=pytesseract.image_to_data(mask,lang="rus+eng",config="--psm 11",
+        langs=set(pytesseract.get_languages(config=""))
+        ocr_lang="rus+eng" if {"rus", "eng"}.issubset(langs) else ("eng" if "eng" in langs else None)
+        if ocr_lang is None:
+            print("[OCR] Tesseract не содержит языков eng/rus; OCR отключён, используется fallback")
+            return []
+        if ocr_lang != "rus+eng":
+            print("[OCR] предупреждение: язык rus не установлен; используется eng")
+        data=pytesseract.image_to_data(mask,lang=ocr_lang,config="--psm 11",
                                        output_type=pytesseract.Output.DICT)
-    except Exception:
+    except Exception as exc:
+        print(f"[OCR] ошибка Tesseract: {exc}; используется fallback")
         return []
     k=400/72.0; out=[]
     for i,t in enumerate(data.get("text",[])):
